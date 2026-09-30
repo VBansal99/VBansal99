@@ -1,0 +1,41 @@
+name: Visor sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours, off the top of the hour when GitHub's queue is busiest
+  workflow_dispatch:          # "Run workflow" button
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/visor-sync.yml"
+      - "assets/*.svg"        # a redesigned panel gets its live strip right away
+
+permissions:
+  contents: write
+
+# one sync at a time; a queued run waits instead of racing the push
+concurrency:
+  group: visor-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # the bot's own commits touch assets/*.svg too; don't let them start another run
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install "fonttools>=4.50,<5"
+
+      - name: Fonts
+        # downloads any of the three panel fonts missing from assets/fonts (committed once)
+        run: |
+          if [ -f scripts/fetch_fonts.py ]; then python
