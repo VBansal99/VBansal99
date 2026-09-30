@@ -26,11 +26,40 @@ jobs:
     # the bot's own commits touch assets/*.svg too; don't let them start another run
     if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+
+      - name: Check files
+        # finds the scripts and fonts even if an upload put them in the wrong folder,
+        # moves them where they belong, and says so on the run's Summary page
+        run: |
+          python - <<'PY'
+          import pathlib, subprocess, sys
+          root = pathlib.Path(".")
+          need = {"scripts": ["visor_font.py", "hud_stats.py", "live_overlays.py", "fetch_fonts.py"],
+                  "assets/fonts": ["Tektur-Medium.ttf", "GeistMono-Regular.ttf", "GeistMono-Bold.ttf"]}
+          optional = {"fetch_fonts.py", "Tektur-Medium.ttf", "GeistMono-Regular.ttf", "GeistMono-Bold.ttf"}
+          missing = []
+          for folder, names in need.items():
+              for name in names:
+                  want = root / folder / name
+                  if want.exists():
+                      continue
+                  found = [p for p in root.rglob(name) if ".git" not in p.parts]
+                  if found:
+                      want.parent.mkdir(parents=True, exist_ok=True)
+                      subprocess.run(["git", "mv", str(found[0]), str(want)], check=True)
+                      print(f"::notice title=Moved {name}::{found[0]} -> {want}")
+                  elif name not in optional:
+                      missing.append(f"{folder}/{name}")
+          if missing:
+              print("::error title=Missing files::Upload these from the zip: " + ", ".join(missing))
+              sys.exit(1)
+          print("all script files in place")
+          PY
 
       - name: Install
         run: pip install "fonttools>=4.50,<5"
@@ -38,4 +67,70 @@ jobs:
       - name: Fonts
         # downloads any of the three panel fonts missing from assets/fonts (committed once)
         run: |
-          if [ -f scripts/fetch_fonts.py ]; then python
+          if [ -f scripts/fetch_fonts.py ]; then python scripts/fetch_fonts.py
+          else echo "::warning::scripts/fetch_fonts.py is missing; upload it from the zip"; fi
+
+      - name: Build live panels
+        working-directory: scripts
+        env:
+          # optional: a VISOR_TOKEN secret (fine-grained, read-only) lets private
+          # contributions count; without it the built-in token is used
+          GITHUB_TOKEN: ${{ secrets.VISOR_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_USER: ${{ github.repository_owner }}
+        run: |
+          # a crash puts its last line on the Summary page instead of just "exit code"
+          for f in hud_stats.py live_overlays.py; do
+            if ! python "$f" 2> err.txt; then
+              cat err.txt
+              echo "::error title=$f crashed::$(tail -n 1 err.txt)"
+              exit 1
+            fi
+            cat err.txt
+          done
+
+      - name: Draw patrol route
+        uses: Platane/snk/svg-only@v3
+        continue-on-error: true   # a snake outage should not hold back the other panels
+        with:
+          github_user_name: ${{ github.repository_owner }}
+          outputs: |
+            assets/patrol.svg?color_snake=#FF2D46&color_dots=#0B1120,#3B0E1A,#7A1628,#C21F37,#FF2D46&color_dot_border=#1B2540
+
+      - name: Check every panel still opens
+        run: |
+          python - <<'PY'
+          import pathlib, sys
+          from xml.dom import minidom
+          bad = []
+          for p in sorted(pathlib.Path("assets").glob("*.svg")):
+              try:
+                  minidom.parse(str(p))
+              except Exception as e:
+                  bad.append(f"{p.name}: {e}")
+          if bad:
+              print("\n".join(bad)); sys.exit(1)
+          print("all panels are valid SVG")
+          PY
+
+      - name: Fail if nothing could be fetched
+        run: |
+          s="$GITHUB_STEP_SUMMARY"
+          if grep -q "kept last good" "$s" && ! grep -q "| updated |" "$s"; then
+            echo "::error::Every GitHub fetch failed. Check the token and the log above."
+            exit 1
+          fi
+
+      - name: Commit
+        run: |
+          git config user.name "visor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A assets scripts
+          if git diff --staged --quiet; then
+            echo "nothing changed"; exit 0
+          fi
+          git commit -m "visor sync $(date -u +'%d %b %H:%M UTC')"
+          for i in 1 2 3; do
+            git pull --rebase --quiet && git push && exit 0
+            echo "push attempt $i failed, retrying"; sleep $((i * 5))
+          done
+          exit 1
